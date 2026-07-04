@@ -2,19 +2,19 @@ import Foundation
 import StoreKit
 import Tauri
 
-struct GetProductsArgs: Decodable {
+struct GetProductsArgs: Decodable, Sendable {
     let productIds: [String]
 }
 
-struct PurchaseArgs: Decodable {
+struct PurchaseArgs: Decodable, Sendable {
     let productId: String
 }
 
-struct FinishTransactionArgs: Decodable {
+struct FinishTransactionArgs: Decodable, Sendable {
     let transactionId: String
 }
 
-struct ProductInfo: Encodable {
+struct ProductInfo: Encodable, Sendable {
     let id: String
     let displayName: String
     let description: String
@@ -24,24 +24,47 @@ struct ProductInfo: Encodable {
     let subscriptionPeriod: String?
 }
 
-struct TransactionInfo: Encodable {
+struct TransactionInfo: Encodable, Sendable {
     let transactionId: String
     let originalTransactionId: String
     let productId: String
     let expiresDateMs: Int64?
 }
 
-struct GetProductsResponse: Encodable {
+struct GetProductsResponse: Encodable, Sendable {
     let products: [ProductInfo]
 }
 
-struct PurchaseResponse: Encodable {
+struct PurchaseResponse: Encodable, Sendable {
     let status: String
     let transaction: TransactionInfo?
 }
 
-struct TransactionsResponse: Encodable {
+struct TransactionsResponse: Encodable, Sendable {
     let transactions: [TransactionInfo]
+}
+
+private final class InvokeResponder: @unchecked Sendable {
+    private let invoke: Invoke
+
+    init(_ invoke: Invoke) {
+        self.invoke = invoke
+    }
+
+    @MainActor
+    func resolve() {
+        invoke.resolve()
+    }
+
+    @MainActor
+    func resolve<T: Encodable & Sendable>(_ data: T) {
+        invoke.resolve(data)
+    }
+
+    @MainActor
+    func reject(_ message: String) {
+        invoke.reject(message)
+    }
 }
 
 private func periodString(_ period: Product.SubscriptionPeriod?) -> String? {
@@ -96,23 +119,25 @@ private func transactionInfo(_ transaction: Transaction) -> TransactionInfo {
 class IapPlugin: Plugin {
     @objc public func getProducts(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(GetProductsArgs.self)
+        let responder = InvokeResponder(invoke)
         Task {
             do {
                 let products = try await Product.products(for: args.productIds)
-                invoke.resolve(GetProductsResponse(products: products.map(productInfo)))
+                await responder.resolve(GetProductsResponse(products: products.map(productInfo)))
             } catch {
-                invoke.reject("get_products_failed: \(error.localizedDescription)")
+                await responder.reject("get_products_failed: \(error.localizedDescription)")
             }
         }
     }
 
     @objc public func purchase(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(PurchaseArgs.self)
+        let responder = InvokeResponder(invoke)
         Task {
             do {
                 let products = try await Product.products(for: [args.productId])
                 guard let product = products.first else {
-                    invoke.reject("product_not_found")
+                    await responder.reject("product_not_found")
                     return
                 }
                 let result = try await product.purchase()
@@ -121,26 +146,27 @@ class IapPlugin: Plugin {
                     // 不在这里 finish：等服务端确认发放后由前端调 finishTransaction，
                     // 中途失败的交易会留在 unfinished 里，下次启动可补验。
                     let transaction = unwrap(verification)
-                    invoke.resolve(
+                    await responder.resolve(
                         PurchaseResponse(
                             status: "success",
                             transaction: transactionInfo(transaction)
                         ))
                 case .userCancelled:
-                    invoke.resolve(PurchaseResponse(status: "cancelled", transaction: nil))
+                    await responder.resolve(PurchaseResponse(status: "cancelled", transaction: nil))
                 case .pending:
                     // 等待家长同意等场景，交易稍后会出现在 unfinished 中
-                    invoke.resolve(PurchaseResponse(status: "pending", transaction: nil))
+                    await responder.resolve(PurchaseResponse(status: "pending", transaction: nil))
                 @unknown default:
-                    invoke.reject("purchase_unknown_result")
+                    await responder.reject("purchase_unknown_result")
                 }
             } catch {
-                invoke.reject("purchase_failed: \(error.localizedDescription)")
+                await responder.reject("purchase_failed: \(error.localizedDescription)")
             }
         }
     }
 
     @objc public func restorePurchases(_ invoke: Invoke) throws {
+        let responder = InvokeResponder(invoke)
         Task {
             // 用户取消 App Store 登录时 sync 会抛错，此时仍返回本地缓存的权益
             try? await AppStore.sync()
@@ -148,22 +174,24 @@ class IapPlugin: Plugin {
             for await result in Transaction.currentEntitlements {
                 transactions.append(transactionInfo(unwrap(result)))
             }
-            invoke.resolve(TransactionsResponse(transactions: transactions))
+            await responder.resolve(TransactionsResponse(transactions: transactions))
         }
     }
 
     @objc public func getUnfinishedTransactions(_ invoke: Invoke) throws {
+        let responder = InvokeResponder(invoke)
         Task {
             var transactions: [TransactionInfo] = []
             for await result in Transaction.unfinished {
                 transactions.append(transactionInfo(unwrap(result)))
             }
-            invoke.resolve(TransactionsResponse(transactions: transactions))
+            await responder.resolve(TransactionsResponse(transactions: transactions))
         }
     }
 
     @objc public func finishTransaction(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(FinishTransactionArgs.self)
+        let responder = InvokeResponder(invoke)
         Task {
             for await result in Transaction.unfinished {
                 let transaction = unwrap(result)
@@ -173,7 +201,7 @@ class IapPlugin: Plugin {
                 }
             }
             // 找不到视为已 finish，幂等处理
-            invoke.resolve()
+            await responder.resolve()
         }
     }
 }
