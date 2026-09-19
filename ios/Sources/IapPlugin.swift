@@ -207,6 +207,6 @@ class IapPlugin: Plugin {
 }
 
 @_cdecl("init_plugin_iap")
-func initPluginIap() -> Plugin {
+public func initPluginIap() -> Plugin {
     return IapPlugin()
 }
